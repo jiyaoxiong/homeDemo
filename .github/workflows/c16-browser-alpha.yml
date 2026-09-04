@@ -78,9 +78,24 @@ jobs:
           A='{%s}' % ANDROID
           ET.register_namespace('android', ANDROID)
 
-          # Brand app and force the real browser launcher activity to landscape.
           tree=ET.parse(manifest)
           mr=tree.getroot()
+
+          # Chrome 155 Android Desktop snapshots contain preview-framework manifest attributes
+          # that Apktool's stable framework cannot link. They are optimization/native-service
+          # hints; remove them in this compatibility Alpha so the ordinary Chromium sandboxed
+          # process services remain available on current production Android builds.
+          stripped=[]
+          for elem in mr.iter():
+              for attr in ('zygotePreloadNativeLib','zygotePreloadNativeFunc','nativeService'):
+                  key=A+attr
+                  if key in elem.attrib:
+                      stripped.append((elem.tag, attr, elem.attrib.get(key)))
+                      elem.attrib.pop(key, None)
+          print('preview framework attrs stripped:', len(stripped))
+          for item in stripped: print('STRIP', *item)
+
+          # Brand app and force the real browser launcher activity to landscape.
           app=mr.find('application')
           if app is not None:
               app.set(A+'label','C16 Browser')
@@ -112,7 +127,6 @@ jobs:
           tree.write(manifest,encoding='utf-8',xml_declaration=True)
           print('launcher nodes patched:',launcher_count)
 
-          # Visible branding resources.
           brand_names={'app_name','application_name','product_name','chrome_app_name','chrome_name','application_label','app_label','browser_app_name'}
           brand_count=0
           for p in root.glob('res/values*/strings.xml'):
@@ -129,40 +143,26 @@ jobs:
                   print('skip string file',p,e)
           print('branding strings patched:',brand_count)
 
-          # C16 14.6-inch touch-friendly dimensions. Only patch exact Chromium resource names that exist.
           overrides={
-              'toolbar_height':'64dp',
-              'toolbar_height_tablet':'64dp',
-              'toolbar_height_no_shadow':'64dp',
-              'tab_strip_height':'52dp',
-              'tabstrip_height':'52dp',
-              'tab_height':'52dp',
-              'tab_strip_toolbar_height':'52dp',
-              'toolbar_button_width':'58dp',
-              'toolbar_button_height':'58dp',
-              'toolbar_button_size':'58dp',
-              'new_tab_button_width':'60dp',
-              'new_tab_button_height':'60dp',
-              'new_tab_button_size':'60dp',
-              'location_bar_text_size':'19sp',
-              'omnibox_text_size':'19sp',
-              'url_bar_text_size':'19sp',
-              'tab_title_text_size':'18sp',
-              'tab_text_size':'18sp',
-              'tab_strip_text_size':'18sp',
-              'omnibox_suggestion_height':'58dp',
-              'omnibox_suggestion_row_height':'58dp'
+              'toolbar_height':'64dp','toolbar_height_tablet':'64dp','toolbar_height_no_shadow':'64dp',
+              'tab_strip_height':'52dp','tabstrip_height':'52dp','tab_height':'52dp','tab_strip_toolbar_height':'52dp',
+              'toolbar_button_width':'58dp','toolbar_button_height':'58dp','toolbar_button_size':'58dp',
+              'new_tab_button_width':'60dp','new_tab_button_height':'60dp','new_tab_button_size':'60dp',
+              'location_bar_text_size':'19sp','omnibox_text_size':'19sp','url_bar_text_size':'19sp',
+              'tab_title_text_size':'18sp','tab_text_size':'18sp','tab_strip_text_size':'18sp',
+              'omnibox_suggestion_height':'58dp','omnibox_suggestion_row_height':'58dp'
           }
           patched=[]
+          candidates=[]
           for p in root.glob('res/values*/dimens.xml'):
               try:
                   t=ET.parse(p); rr=t.getroot(); changed=False
                   for el in rr.findall('dimen'):
                       name=el.get('name','')
+                      if any(k in name for k in ('toolbar','tab_strip','tabstrip','omnibox','location_bar','url_bar')):
+                          candidates.append((name,el.text,str(p)))
                       if name in overrides:
-                          old=el.text
-                          el.text=overrides[name]
-                          changed=True
+                          old=el.text; el.text=overrides[name]; changed=True
                           patched.append((name,old,el.text,str(p)))
                   if changed:
                       t.write(p,encoding='utf-8',xml_declaration=True)
@@ -170,13 +170,11 @@ jobs:
                   print('skip dimen file',p,e)
           print('dimensions patched:',len(patched))
           for item in patched[:150]: print('DIM',*item)
+          print('candidate dimensions:',len(candidates))
+          for item in candidates[:300]: print('CAND',*item)
 
           Path('C16_BUILD_INFO.txt').write_text(
-              'C16 Browser Alpha\n'
-              'Full Chromium Android Desktop ARM64 base\n'
-              'No Android WebView wrapper\n'
-              'Landscape C16 car-display patch\n'
-              'Touch-friendly Chromium toolbar/tab resource patch\n',encoding='utf-8')
+              'C16 Browser Alpha\nFull Chromium Android Desktop ARM64 base\nNo Android WebView wrapper\nLandscape C16 car-display patch\nChromium 155 preview-manifest compatibility patch\n',encoding='utf-8')
           PY
 
       - name: Rebuild Chromium APK
