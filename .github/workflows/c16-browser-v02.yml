@@ -78,8 +78,6 @@ jobs:
           ET.register_namespace('android', ANDROID)
           tree=ET.parse(manifest)
           mr=tree.getroot()
-
-          # Apktool stable framework cannot relink a few Android preview attributes used by this snapshot.
           stripped=[]
           for elem in mr.iter():
               for attr in ('zygotePreloadNativeLib','zygotePreloadNativeFunc','nativeService'):
@@ -88,12 +86,10 @@ jobs:
                       stripped.append((elem.tag, attr, elem.attrib.get(key)))
                       elem.attrib.pop(key, None)
           print('preview attrs stripped:', len(stripped))
-
           app=mr.find('application')
           if app is not None:
               app.set(A+'label','C16 Browser')
               app.set(A+'resizeableActivity','true')
-
           activities=list(mr.findall('./application/activity'))
           aliases=list(mr.findall('./application/activity-alias'))
           launchers=0
@@ -117,8 +113,6 @@ jobs:
                   target.set(A+'resizeableActivity','true')
           tree.write(manifest,encoding='utf-8',xml_declaration=True)
           print('launcher nodes patched:', launchers)
-
-          # Visible app name resources.
           brand_names={'app_name','application_name','product_name','chrome_app_name','chrome_name','application_label','app_label','browser_app_name'}
           changed=0
           for p in root.glob('res/values*/strings.xml'):
@@ -144,68 +138,52 @@ jobs:
           import re
 
           root=Path('c16-decoded')
-          files=list(root.glob('smali*/**/*.smali'))
-          candidates=[]
-          needle='Lorg/chromium/base/CommandLineInitUtil;->initCommandLine'
-          for p in files:
-              try:
-                  txt=p.read_text(encoding='utf-8')
-              except Exception:
-                  continue
-              if needle in txt:
-                  score=0
-                  s=str(p)
-                  if 'SplitCompatApplication' in s: score+=100
-                  if 'ChromeApplication' in s: score+=50
-                  candidates.append((score,p,txt))
-          if not candidates:
-              raise SystemExit('Could not find Chromium command-line initialization smali')
-          candidates.sort(key=lambda x:x[0], reverse=True)
-          score,p,txt=candidates[0]
-          print('injecting into:',p,'score=',score)
+          matches=list(root.glob('smali*/org/chromium/base/CommandLine.smali'))
+          if not matches:
+              matches=[p for p in root.glob('smali*/**/CommandLine.smali') if 'org/chromium/base' in str(p)]
+          if not matches:
+              raise SystemExit('CommandLine.smali not found')
+          p=matches[0]
+          txt=p.read_text(encoding='utf-8')
+          print('patching:', p)
 
-          pos=txt.find(needle)
-          method_start=txt.rfind('\n.method ',0,pos)
-          method_end=txt.find('\n.end method',pos)
-          if method_start<0 or method_end<0:
-              raise SystemExit('Could not locate method around initCommandLine')
-          method=txt[method_start:method_end]
-          lm=re.search(r'(?m)^\s*\.locals\s+(\d+)\s*$',method)
+          method_re=re.compile(r'(?ms)^\.method[^\n]*\binitInternal\(\[Ljava/lang/String;\)V\n(.*?)^\.end method')
+          m=method_re.search(txt)
+          if not m:
+              raise SystemExit('CommandLine.initInternal([Ljava/lang/String;)V not found')
+          full=m.group(0)
+          lm=re.search(r'(?m)^\s*\.locals\s+(\d+)\s*$', full)
           if not lm:
-              raise SystemExit('Target method does not use .locals; refusing unsafe injection')
-          old_locals=int(lm.group(1))
-          obj=f'v{old_locals}'
-          arg=f'v{old_locals+1}'
-          method=method[:lm.start()] + re.sub(r'\.locals\s+\d+', f'.locals {old_locals+2}', lm.group(0)) + method[lm.end():]
+              raise SystemExit('initInternal does not use .locals')
+          old=int(lm.group(1))
+          temp=f'v{old}'
+          full=full[:lm.start()] + re.sub(r'\.locals\s+\d+', f'.locals {old+1}', lm.group(0)) + full[lm.end():]
 
-          call_pos=method.find(needle)
-          line_end=method.find('\n',call_pos)
-          if line_end<0: line_end=len(method)
           flags=['disable-gpu','disable-gpu-compositing','disable-gpu-early-init','disable-vulkan','disable-gpu-watchdog']
-          inject=['', '    # C16 Browser v0.2: emulator/vehicle GPU compatibility switches',
-                  '    invoke-static {}, Lorg/chromium/base/CommandLine;->getInstance()Lorg/chromium/base/CommandLine;',
-                  f'    move-result-object {obj}']
+          injection=['    # C16 Browser v0.2 GPU compatibility switches']
           for flag in flags:
-              inject += [f'    const-string {arg}, "{flag}"',
-                         f'    invoke-virtual {{{obj}, {arg}}}, Lorg/chromium/base/CommandLine;->appendSwitch(Ljava/lang/String;)V']
-          inject_text='\n'+'\n'.join(inject)+'\n'
-          method=method[:line_end+1]+inject_text+method[line_end+1:]
-          txt=txt[:method_start]+method+txt[method_end:]
+              injection += [f'    const-string {temp}, "{flag}"',
+                            f'    invoke-virtual {{p0, {temp}}}, Lorg/chromium/base/CommandLine;->appendSwitch(Ljava/lang/String;)V']
+          injection='\n'+'\n'.join(injection)+'\n'
+          ret=full.rfind('    return-void')
+          if ret < 0:
+              raise SystemExit('return-void not found in initInternal')
+          full=full[:ret]+injection+full[ret:]
+          txt=txt[:m.start()]+full+txt[m.end():]
           p.write_text(txt,encoding='utf-8')
-          print('injected flags:', ','.join(flags))
-          print('locals:',old_locals,'->',old_locals+2)
 
-          # Verify the injected strings exist in the final smali tree.
           verify=p.read_text(encoding='utf-8')
-          for f in flags:
-              if f'"{f}"' not in verify:
-                  raise SystemExit('missing injected flag '+f)
+          for flag in flags:
+              if f'"{flag}"' not in verify:
+                  raise SystemExit('missing injected flag '+flag)
+          print('injected:', ', '.join(flags))
+          print('locals:', old, '->', old+1)
           Path('C16_BUILD_INFO.txt').write_text(
               'C16 Browser Alpha v0.2\n'
               'Full Chromium Android Desktop ARM64\n'
               'No Android WebView wrapper\n'
               'Landscape launcher\n'
-              'GPU crash compatibility switches injected into Chromium startup\n'
+              'GPU compatibility flags injected inside Chromium CommandLine.initInternal()\n'
               'Flags: '+', '.join(flags)+'\n',encoding='utf-8')
           PY
 
