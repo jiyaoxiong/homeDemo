@@ -37,12 +37,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
+          REPO="${{ github.repository }}"
           TAG="c16-browser-alpha-20260905"
-          gh release view "$TAG" >/dev/null 2>&1 && gh release delete "$TAG" --yes || true
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 && gh release delete "$TAG" --repo "$REPO" --yes || true
           gh release create "$TAG" \
             C16Browser-Alpha.apk \
             C16Browser-Alpha.apk.sha256 \
             CHROMIUM_SNAPSHOT.txt \
             C16_BUILD_INFO.txt \
+            --repo "$REPO" \
             --title "C16 Browser Alpha - Full Chromium ARM64" \
             --notes "C16 Browser Alpha for Leapmotor C16. Full Chromium Android Desktop ARM64 base; no Android WebView wrapper. Landscape/branding compatibility build for C16 testing."
