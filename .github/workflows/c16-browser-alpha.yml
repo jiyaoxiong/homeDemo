@@ -1,0 +1,170 @@
+name: Build C16 Chromium Browser Alpha
+
+on:
+  push:
+    paths:
+      - '.github/workflows/c16-browser-alpha.yml'
+      - 'c16/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download latest full Chromium Android Desktop ARM64 APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, urllib.request
+          api='https://api.github.com/repos/andrewginns/chromium-browser-snapshots-AndroidDesktop_arm64/releases/latest'
+          req=urllib.request.Request(api, headers={'User-Agent':'C16-Browser-Builder'})
+          with urllib.request.urlopen(req) as r:
+              data=json.load(r)
+          assets=data.get('assets', [])
+          apk=next((a for a in assets if a.get('name')=='ChromePublic.apk'), None)
+          if not apk:
+              raise SystemExit('ChromePublic.apk not found in latest release')
+          print('release:', data.get('tag_name'))
+          print('url:', apk['browser_download_url'])
+          urllib.request.urlretrieve(apk['browser_download_url'], 'ChromePublic.apk')
+          PY
+          ls -lh ChromePublic.apk
+
+      - name: Install APK tooling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y apktool zipalign
+          apktool --version
+          ls "$ANDROID_HOME/build-tools" | sort -V | tail
+
+      - name: Decode Chromium resources (keep DEX/native code intact)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apktool d -f -s ChromePublic.apk -o c16-decoded
+
+      - name: Apply C16 car UI resource patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, xml.etree.ElementTree as ET
+
+          root=Path('c16-decoded')
+
+          # Brand visible Chromium labels as C16 Browser.
+          for p in root.glob('res/values*/strings.xml'):
+              try:
+                  txt=p.read_text(encoding='utf-8')
+              except Exception:
+                  continue
+              txt=txt.replace('>Chromium<','>C16 Browser<')
+              txt=txt.replace('>Chromium</string>','>C16 Browser</string>')
+              p.write_text(txt,encoding='utf-8')
+
+          # Explicitly patch common application-name resources if present.
+          brand_names={'app_name','application_name','product_name','chrome_app_name','chrome_name'}
+          for p in root.glob('res/values*/strings.xml'):
+              try:
+                  tree=ET.parse(p)
+                  r=tree.getroot(); changed=False
+                  for el in r.findall('string'):
+                      if el.attrib.get('name') in brand_names:
+                          el.text='C16 Browser'; changed=True
+                  if changed:
+                      tree.write(p,encoding='utf-8',xml_declaration=True)
+              except Exception:
+                  pass
+
+          # Enlarge key desktop/tablet Chrome controls for a 14.6-inch car display.
+          dim_overrides={
+              'toolbar_height':'64dp',
+              'toolbar_height_tablet':'64dp',
+              'tab_strip_height':'52dp',
+              'tabstrip_height':'52dp',
+              'tab_height':'52dp',
+              'toolbar_button_width':'58dp',
+              'toolbar_button_height':'58dp',
+              'new_tab_button_width':'60dp',
+              'new_tab_button_height':'60dp',
+              'location_bar_text_size':'19sp',
+              'omnibox_text_size':'19sp',
+              'url_bar_text_size':'19sp',
+              'tab_title_text_size':'18sp',
+              'tab_text_size':'18sp',
+          }
+          patched=[]
+          for p in root.glob('res/values*/dimens.xml'):
+              try:
+                  tree=ET.parse(p); r=tree.getroot(); changed=False
+                  for el in r.findall('dimen'):
+                      name=el.attrib.get('name','')
+                      if name in dim_overrides:
+                          el.text=dim_overrides[name]; changed=True; patched.append((name,dim_overrides[name],str(p)))
+                  if changed:
+                      tree.write(p,encoding='utf-8',xml_declaration=True)
+              except Exception:
+                  pass
+          print('dimension patches:', len(patched))
+          for x in patched[:100]: print(*x)
+
+          # Force the main Chromium browsing activity to landscape where possible.
+          manifest=root/'AndroidManifest.xml'
+          txt=manifest.read_text(encoding='utf-8')
+          # Preserve Chromium's activity graph; only add/replace orientation on the launcher activity.
+          # Match activities containing MAIN/LAUNCHER and patch the nearest opening activity tag.
+          m=re.search(r'<activity\b[^>]*>.*?<action\s+android:name="android.intent.action.MAIN".*?<category\s+android:name="android.intent.category.LAUNCHER"', txt, re.S)
+          if m:
+              start=txt.rfind('<activity',0,m.start()+1)
+              end=txt.find('>',start)
+              tag=txt[start:end+1]
+              if 'android:screenOrientation=' in tag:
+                  tag=re.sub(r'android:screenOrientation="[^"]*"','android:screenOrientation="landscape"',tag)
+              else:
+                  tag=tag[:-1]+' android:screenOrientation="landscape">'
+              txt=txt[:start]+tag+txt[end+1:]
+              manifest.write_text(txt,encoding='utf-8')
+              print('launcher activity forced landscape')
+          else:
+              print('launcher activity pattern not found; continuing')
+          PY
+
+      - name: Rebuild C16 Browser APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apktool b c16-decoded -o C16Browser-unsigned.apk
+          ls -lh C16Browser-unsigned.apk
+
+      - name: Sign APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          keytool -genkeypair -v -keystore c16-release.jks -storepass c16browser -keypass c16browser -alias c16 -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=C16 Browser, OU=C16, O=C16, L=Kunming, ST=Yunnan, C=CN'
+          "$BUILD_TOOLS/zipalign" -f -p 4 C16Browser-unsigned.apk C16Browser-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign --ks c16-release.jks --ks-key-alias c16 --ks-pass pass:c16browser --key-pass pass:c16browser --out C16Browser-Alpha.apk C16Browser-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose C16Browser-Alpha.apk
+          sha256sum C16Browser-Alpha.apk | tee C16Browser-Alpha.apk.sha256
+          ls -lh C16Browser-Alpha.apk
+
+      - name: Upload C16 Browser APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: C16Browser-Alpha-APK
+          path: |
+            C16Browser-Alpha.apk
+            C16Browser-Alpha.apk.sha256
+          if-no-files-found: error
+          compression-level: 0
