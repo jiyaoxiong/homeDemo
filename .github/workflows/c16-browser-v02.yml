@@ -1,39 +1,31 @@
-name: Build C16 Browser v0.2
+name: Build C16 Browser v0.2 Compat
 
 on:
   pull_request:
     branches: [ main ]
     paths:
       - 'c16-v02/**'
-  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download full Chromium Android Desktop ARM64 APK
+      - name: Download Chromium snapshot 1676249
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
-          import json, urllib.request
-          api='https://api.github.com/repos/andrewginns/chromium-browser-snapshots-AndroidDesktop_arm64/releases/latest'
-          req=urllib.request.Request(api, headers={'User-Agent':'C16-Browser-v02-Builder'})
-          with urllib.request.urlopen(req, timeout=60) as r:
-              data=json.load(r)
-          apk=next((a for a in data.get('assets', []) if a.get('name')=='ChromePublic.apk'), None)
-          if not apk:
-              raise SystemExit('ChromePublic.apk not found')
-          print('snapshot:', data.get('tag_name'))
-          urllib.request.urlretrieve(apk['browser_download_url'], 'ChromePublic.apk')
-          open('CHROMIUM_SNAPSHOT.txt','w').write(str(data.get('tag_name'))+'\n')
+          import urllib.request
+          url='https://github.com/andrewginns/chromium-browser-snapshots-AndroidDesktop_arm64/releases/download/1676249/ChromePublic.apk'
+          urllib.request.urlretrieve(url, 'ChromePublic.apk')
+          open('CHROMIUM_SNAPSHOT.txt','w').write('1676249\n')
           PY
           ls -lh ChromePublic.apk
           sha256sum ChromePublic.apk
@@ -44,169 +36,75 @@ jobs:
           set -euxo pipefail
           python3 - <<'PY'
           import json, urllib.request
-          api='https://api.github.com/repos/iBotPeaches/Apktool/releases/latest'
-          req=urllib.request.Request(api, headers={'User-Agent':'C16-Browser-v02-Builder'})
-          with urllib.request.urlopen(req, timeout=60) as r:
-              data=json.load(r)
-          jar=next((a for a in data.get('assets', []) if a.get('name','').endswith('.jar') and 'apktool' in a.get('name','').lower()), None)
-          if not jar:
-              raise SystemExit('Apktool jar not found')
-          urllib.request.urlretrieve(jar['browser_download_url'], 'apktool.jar')
-          print('apktool:', jar['name'])
+          req=urllib.request.Request('https://api.github.com/repos/iBotPeaches/Apktool/releases/latest',headers={'User-Agent':'C16-v02-builder'})
+          with urllib.request.urlopen(req,timeout=60) as r: data=json.load(r)
+          jar=next(a for a in data['assets'] if a['name'].endswith('.jar') and 'apktool' in a['name'].lower())
+          urllib.request.urlretrieve(jar['browser_download_url'],'apktool.jar')
+          print(jar['name'])
           PY
           java -jar apktool.jar --version
 
-      - name: Decode Chromium including DEX smali
+      - name: Decode resources and preserve Chromium code
         shell: bash
         run: |
           set -euxo pipefail
-          java -Xmx6g -jar apktool.jar d -f ChromePublic.apk -o c16-decoded
-          du -sh c16-decoded
-          find c16-decoded -maxdepth 1 -type d -name 'smali*' -print
+          java -Xmx5g -jar apktool.jar d -f -s ChromePublic.apk -o decoded
 
-      - name: Apply C16 branding and manifest compatibility patch
+      - name: Apply C16 compatibility patch
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
-          root=Path('c16-decoded')
+          root=Path('decoded')
           manifest=root/'AndroidManifest.xml'
-          ANDROID='http://schemas.android.com/apk/res/android'
-          A='{%s}' % ANDROID
-          ET.register_namespace('android', ANDROID)
-          tree=ET.parse(manifest)
-          mr=tree.getroot()
-          stripped=[]
-          for elem in mr.iter():
-              for attr in ('zygotePreloadNativeLib','zygotePreloadNativeFunc','nativeService'):
-                  key=A+attr
-                  if key in elem.attrib:
-                      stripped.append((elem.tag, attr, elem.attrib.get(key)))
-                      elem.attrib.pop(key, None)
-          print('preview attrs stripped:', len(stripped))
+          ANDROID='http://schemas.android.com/apk/res/android'; A='{%s}'%ANDROID
+          ET.register_namespace('android',ANDROID)
+          t=ET.parse(manifest); mr=t.getroot()
+          for e in mr.iter():
+              for a in ('zygotePreloadNativeLib','zygotePreloadNativeFunc','nativeService'):
+                  e.attrib.pop(A+a,None)
           app=mr.find('application')
           if app is not None:
               app.set(A+'label','C16 Browser')
               app.set(A+'resizeableActivity','true')
           activities=list(mr.findall('./application/activity'))
-          aliases=list(mr.findall('./application/activity-alias'))
-          launchers=0
-          for node in activities+aliases:
-              is_launcher=False
-              for filt in node.findall('intent-filter'):
-                  actions={x.get(A+'name') for x in filt.findall('action')}
-                  cats={x.get(A+'name') for x in filt.findall('category')}
-                  if 'android.intent.action.MAIN' in actions and 'android.intent.category.LAUNCHER' in cats:
-                      is_launcher=True
-              if not is_launcher:
-                  continue
-              launchers += 1
+          for node in activities+list(mr.findall('./application/activity-alias')):
+              launcher=False
+              for f in node.findall('intent-filter'):
+                  acts={x.get(A+'name') for x in f.findall('action')}
+                  cats={x.get(A+'name') for x in f.findall('category')}
+                  launcher |= 'android.intent.action.MAIN' in acts and 'android.intent.category.LAUNCHER' in cats
+              if not launcher: continue
               node.set(A+'label','C16 Browser')
-              target=node if node.tag=='activity' else None
-              if node.tag=='activity-alias':
-                  target_name=node.get(A+'targetActivity')
-                  target=next((a for a in activities if a.get(A+'name')==target_name), None)
+              target=node if node.tag=='activity' else next((a for a in activities if a.get(A+'name')==node.get(A+'targetActivity')),None)
               if target is not None:
                   target.set(A+'screenOrientation','landscape')
                   target.set(A+'resizeableActivity','true')
-          tree.write(manifest,encoding='utf-8',xml_declaration=True)
-          print('launcher nodes patched:', launchers)
-          brand_names={'app_name','application_name','product_name','chrome_app_name','chrome_name','application_label','app_label','browser_app_name'}
-          changed=0
-          for p in root.glob('res/values*/strings.xml'):
-              try:
-                  t=ET.parse(p); rr=t.getroot(); dirty=False
-                  for el in rr.findall('string'):
-                      n=el.get('name','')
-                      text=''.join(el.itertext()).strip()
-                      if n in brand_names or text=='Chromium':
-                          el.text='C16 Browser'; dirty=True; changed+=1
-                  if dirty: t.write(p,encoding='utf-8',xml_declaration=True)
-              except Exception as e:
-                  print('skip strings', p, e)
-          print('branding strings patched:', changed)
+          t.write(manifest,encoding='utf-8',xml_declaration=True)
+          Path('C16_BUILD_INFO.txt').write_text('C16 Browser Alpha v0.2 Compat\nFull Chromium Android Desktop ARM64\nNo Android WebView wrapper\nChromium snapshot: 1676249\nLandscape C16 launcher\n',encoding='utf-8')
           PY
 
-      - name: Inject emulator-safe Chromium GPU startup switches
+      - name: Rebuild Chromium APK
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          java -Xmx5g -jar apktool.jar b decoded -o unsigned.apk
 
-          root=Path('c16-decoded')
-          matches=list(root.glob('smali*/org/chromium/base/CommandLine.smali'))
-          if not matches:
-              matches=[p for p in root.glob('smali*/**/CommandLine.smali') if 'org/chromium/base' in str(p)]
-          if not matches:
-              raise SystemExit('CommandLine.smali not found')
-          p=matches[0]
-          txt=p.read_text(encoding='utf-8')
-          print('patching:', p)
-
-          method_re=re.compile(r'(?ms)^\.method[^\n]*\binitInternal\(\[Ljava/lang/String;\)V\n(.*?)^\.end method')
-          m=method_re.search(txt)
-          if not m:
-              raise SystemExit('CommandLine.initInternal([Ljava/lang/String;)V not found')
-          full=m.group(0)
-          lm=re.search(r'(?m)^\s*\.locals\s+(\d+)\s*$', full)
-          if not lm:
-              raise SystemExit('initInternal does not use .locals')
-          old=int(lm.group(1))
-          temp=f'v{old}'
-          full=full[:lm.start()] + re.sub(r'\.locals\s+\d+', f'.locals {old+1}', lm.group(0)) + full[lm.end():]
-
-          flags=['disable-gpu','disable-gpu-compositing','disable-gpu-early-init','disable-vulkan','disable-gpu-watchdog']
-          injection=['    # C16 Browser v0.2 GPU compatibility switches']
-          for flag in flags:
-              injection += [f'    const-string {temp}, "{flag}"',
-                            f'    invoke-virtual {{p0, {temp}}}, Lorg/chromium/base/CommandLine;->appendSwitch(Ljava/lang/String;)V']
-          injection='\n'+'\n'.join(injection)+'\n'
-          ret=full.rfind('    return-void')
-          if ret < 0:
-              raise SystemExit('return-void not found in initInternal')
-          full=full[:ret]+injection+full[ret:]
-          txt=txt[:m.start()]+full+txt[m.end():]
-          p.write_text(txt,encoding='utf-8')
-
-          verify=p.read_text(encoding='utf-8')
-          for flag in flags:
-              if f'"{flag}"' not in verify:
-                  raise SystemExit('missing injected flag '+flag)
-          print('injected:', ', '.join(flags))
-          print('locals:', old, '->', old+1)
-          Path('C16_BUILD_INFO.txt').write_text(
-              'C16 Browser Alpha v0.2\n'
-              'Full Chromium Android Desktop ARM64\n'
-              'No Android WebView wrapper\n'
-              'Landscape launcher\n'
-              'GPU compatibility flags injected inside Chromium CommandLine.initInternal()\n'
-              'Flags: '+', '.join(flags)+'\n',encoding='utf-8')
-          PY
-
-      - name: Rebuild Chromium v0.2 APK
+      - name: Align sign and verify
         shell: bash
         run: |
           set -euxo pipefail
-          java -Xmx6g -jar apktool.jar b c16-decoded -o C16Browser-v02-unsigned.apk
-          ls -lh C16Browser-v02-unsigned.apk
-
-      - name: Align sign and verify APK
-        shell: bash
-        run: |
-          set -euxo pipefail
-          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
-          keytool -genkeypair -v -keystore c16-v02.jks -storepass c16browser -keypass c16browser -alias c16 -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=C16 Browser v0.2, OU=Car Browser, O=C16, L=Kunming, ST=Yunnan, C=CN'
-          "$BUILD_TOOLS/zipalign" -f -p 4 C16Browser-v02-unsigned.apk C16Browser-v02-aligned.apk
-          "$BUILD_TOOLS/apksigner" sign --ks c16-v02.jks --ks-key-alias c16 --ks-pass pass:c16browser --key-pass pass:c16browser --out C16Browser-Alpha-v0.2.apk C16Browser-v02-aligned.apk
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs C16Browser-Alpha-v0.2.apk | tee SIGNATURE_VERIFY.txt
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          keytool -genkeypair -v -keystore c16.jks -storepass c16browser -keypass c16browser -alias c16 -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=C16 Browser v0.2, OU=Car Browser, O=C16, L=Kunming, ST=Yunnan, C=CN'
+          "$BT/zipalign" -f -p 4 unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks c16.jks --ks-key-alias c16 --ks-pass pass:c16browser --key-pass pass:c16browser --out C16Browser-Alpha-v0.2.apk aligned.apk
+          "$BT/apksigner" verify --verbose --print-certs C16Browser-Alpha-v0.2.apk | tee SIGNATURE_VERIFY.txt
           sha256sum C16Browser-Alpha-v0.2.apk | tee C16Browser-Alpha-v0.2.apk.sha256
           ls -lh C16Browser-Alpha-v0.2.apk
 
-      - name: Upload signed v0.2 APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: C16Browser-Alpha-v0.2-APK
@@ -216,5 +114,5 @@ jobs:
             CHROMIUM_SNAPSHOT.txt
             C16_BUILD_INFO.txt
             SIGNATURE_VERIFY.txt
-          if-no-files-found: error
           compression-level: 0
+          if-no-files-found: error
